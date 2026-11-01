@@ -1,0 +1,206 @@
+name: Deploy
+
+# Manual, deliberate deployments of one environment. Nothing deploys automatically.
+# Environment values are repository variables/secrets named with a prefix (DEV_, UAT_, STAGING_, PROD_); see docs/environments.md.
+# Gates that work on every GitHub plan: the commit must have passed CI, staging/production need a complete release record
+# (scripts/check-release-record.mjs) and production needs a typed confirmation. Where your GitHub plan supports it, also add
+# required reviewers on environments and require status checks on main (see docs/release-runbook.md).
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        options: [dev, uat, staging, production]
+        required: true
+      ref:
+        description: 'Release tag (for example v1.0.0). dev may also use a branch name.'
+        type: string
+        required: true
+      apply_migrations:
+        description: Apply database migrations first (a dry run is always printed before applying)
+        type: boolean
+        default: false
+      confirm_production:
+        description: 'Production only: type exactly  DEPLOY <tag> TO PRODUCTION'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  checks: read
+
+concurrency:
+  group: deploy-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: Gate (CI green, release record, confirmation)
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      key: ${{ steps.resolve.outputs.key }}
+      app_env: ${{ steps.resolve.outputs.app_env }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Resolve and validate inputs
+        id: resolve
+        env:
+          TARGET: ${{ inputs.environment }}
+          REF: ${{ inputs.ref }}
+          CONFIRM: ${{ inputs.confirm_production }}
+        run: |
+          set -euo pipefail
+          case "$TARGET" in
+            dev) key=DEV; app_env=development ;;
+            uat) key=UAT; app_env=uat ;;
+            staging) key=STAGING; app_env=staging ;;
+            production) key=PROD; app_env=production ;;
+            *) echo "unknown environment"; exit 1 ;;
+          esac
+          sha="$(git rev-parse HEAD)"
+          if [ "$TARGET" != "dev" ]; then
+            if ! printf '%s' "$REF" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[a-z0-9.]+)?$'; then
+              echo "::error::$TARGET deployments must use a release tag like v1.2.3"; exit 1
+            fi
+            git fetch --tags --force --quiet
+            git rev-parse --verify --quiet "refs/tags/$REF" >/dev/null || { echo "::error::tag $REF does not exist"; exit 1; }
+          fi
+          if [ "$TARGET" = "production" ] && [ "$CONFIRM" != "DEPLOY $REF TO PRODUCTION" ]; then
+            echo "::error::confirmation text does not match. Type exactly: DEPLOY $REF TO PRODUCTION"; exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+          echo "app_env=$app_env" >> "$GITHUB_OUTPUT"
+      - name: Require a successful CI run for this exact commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          result="$(gh api "repos/$REPO/commits/$SHA/check-runs" --paginate --jq '.check_runs[] | select(.name=="Checks (format, secrets, types, tests, build)") | .conclusion' | sort -u | tr '\n' ' ')"
+          echo "CI conclusion for $SHA: ${result:-none}"
+          if [ "${result% }" != "success" ]; then
+            echo "::error::commit $SHA has no passing CI run. Push the tag to a commit that passed CI first."; exit 1
+          fi
+      # The record is read from the default branch (not the tag) so evidence collected AFTER tagging (UAT acceptance, staging
+      # smoke, approval) never forces a re-tag. The record names the commit it is about; the gate compares it with the tag.
+      - name: Fetch release records from the default branch
+        if: inputs.environment != 'dev'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: release-records
+      - name: Check the release record
+        if: inputs.environment != 'dev'
+        env:
+          TARGET: ${{ inputs.environment }}
+          REF: ${{ inputs.ref }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+        run: node scripts/check-release-record.mjs --version "$REF" --stage "$TARGET" --commit "$SHA" --dir release-records/docs/releases
+
+  database:
+    name: Database migrations
+    needs: gate
+    if: inputs.apply_migrations
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+      - name: Link the target project, show what would run, then apply
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_DB_PASSWORD: ${{ secrets[format('{0}_SUPABASE_DB_PASSWORD', needs.gate.outputs.key)] }}
+          PROJECT_REF: ${{ vars[format('{0}_SUPABASE_PROJECT_REF', needs.gate.outputs.key)] }}
+        run: |
+          set -euo pipefail
+          test -n "$PROJECT_REF" || { echo "::error::set the repository variable for this environment's project ref"; exit 1; }
+          supabase link --project-ref "$PROJECT_REF"
+          echo "::group::Migrations that would be applied"
+          supabase db push --dry-run
+          echo "::endgroup::"
+          supabase db push
+
+  web:
+    name: Build and deploy web
+    needs: [gate, database]
+    # run when the gate passed and migrations either succeeded or were not requested
+    if: ${{ !cancelled() && needs.gate.result == 'success' && (needs.database.result == 'success' || needs.database.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - run: npm ci --prefix apps/web
+      - name: Build with this environment's public settings
+        env:
+          VITE_SUPABASE_URL: ${{ vars[format('{0}_SUPABASE_URL', needs.gate.outputs.key)] }}
+          VITE_SUPABASE_PUBLISHABLE_KEY: ${{ vars[format('{0}_SUPABASE_PUBLISHABLE_KEY', needs.gate.outputs.key)] }}
+          VITE_APP_ENV: ${{ needs.gate.outputs.app_env }}
+        run: |
+          set -euo pipefail
+          test -n "$VITE_SUPABASE_URL" && test -n "$VITE_SUPABASE_PUBLISHABLE_KEY" || { echo "::error::missing Supabase URL or publishable key variable for this environment"; exit 1; }
+          npm run build --prefix apps/web
+          test -f apps/web/dist/_headers && test -f apps/web/dist/_redirects
+      - name: Deploy to this environment's Cloudflare Pages project
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy apps/web/dist --project-name=${{ vars[format('{0}_CF_PROJECT', needs.gate.outputs.key)] }} --branch=main
+
+  smoke:
+    name: Post-deploy smoke checks
+    needs: [gate, web]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Wait for the new version to be served, then check it
+        env:
+          SMOKE_WEB_URL: ${{ vars[format('{0}_WEB_URL', needs.gate.outputs.key)] }}
+          SMOKE_SUPABASE_URL: ${{ vars[format('{0}_SUPABASE_URL', needs.gate.outputs.key)] }}
+          SMOKE_SUPABASE_KEY: ${{ vars[format('{0}_SUPABASE_PUBLISHABLE_KEY', needs.gate.outputs.key)] }}
+        run: |
+          sleep 20
+          node scripts/smoke.mjs
+      - name: Summary
+        if: always()
+        env:
+          TARGET: ${{ inputs.environment }}
+          REF: ${{ inputs.ref }}
+          SHA: ${{ needs.gate.outputs.sha }}
+          STATUS: ${{ job.status }}
+        run: |
+          {
+            echo "### Deploy $REF to $TARGET: $STATUS"
+            echo "Commit: \`$SHA\`"
+            if [ "$STATUS" != "success" ]; then
+              echo ""
+              echo "**Smoke checks failed.** Roll back by running this workflow again with the previous release tag. Database changes are forward-fix only (docs/release-runbook.md)."
+            else
+              echo ""
+              echo "Record the result in docs/releases/$REF.md (Staging smoke / Production deployed)."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

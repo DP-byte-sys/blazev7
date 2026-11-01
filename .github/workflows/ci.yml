@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    # The deploy workflow looks for a successful run of a job with exactly this name before it deploys a commit.
+    name: Checks (format, secrets, types, tests, build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: '**/package-lock.json'
+      - run: npm ci
+      - run: npm ci --prefix packages/shared
+      - run: npm ci --prefix apps/web
+      - run: npm ci --prefix apps/mobile
+      # format, secret scan, typecheck, database/unit tests, web lint+tests+build, mobile typecheck+tests
+      - run: npm run check
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Audit production dependencies (root, shared, web block on high or critical)
+        run: |
+          failed=0
+          for dir in . packages/shared apps/web; do
+            echo "::group::npm audit $dir"
+            npm audit --omit=dev --audit-level=high --prefix "$dir" || failed=1
+            echo "::endgroup::"
+          done
+          exit $failed
+      - name: Audit mobile production dependencies (report only; see docs/release-runbook.md)
+        continue-on-error: true
+        run: npm audit --omit=dev --audit-level=high --prefix apps/mobile
+
+  supabase-real-stack:
+    # Applies every migration plus the seed to a REAL local Supabase stack (Docker on the runner), runs the pgTAP tests
+    # in supabase/tests/database and the read-only anonymous-access smoke checks against the real API.
+    name: Supabase local stack (migrations, pgTAP, API smoke)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Start local Supabase (only the services the tests need)
+        run: supabase start -x realtime,storage-api,imgproxy,mailpit,postgres-meta,studio,edge-runtime,logflare,vector,supavisor
+      - name: Apply migrations and seed from scratch
+        run: supabase db reset
+      - name: pgTAP tests
+        run: supabase test db
+      - name: Anonymous-access smoke checks against the real API
+        run: |
+          supabase status -o env > "$RUNNER_TEMP/supabase.env"
+          set -a
+          . "$RUNNER_TEMP/supabase.env"
+          set +a
+          export SMOKE_SUPABASE_URL="$API_URL"
+          export SMOKE_SUPABASE_KEY="${ANON_KEY:-$PUBLISHABLE_KEY}"
+          node scripts/smoke.mjs
+      - name: Stop local Supabase
+        if: always()
+        run: supabase stop --no-backup

@@ -1,0 +1,26 @@
+{
+  "cli": { "version": ">= 16.0.0", "appVersionSource": "remote" },
+  "build": {
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal",
+      "env": { "APP_ENV": "development" },
+      "android": { "buildType": "apk" }
+    },
+    "uat": {
+      "distribution": "internal",
+      "env": { "APP_ENV": "uat" },
+      "android": { "buildType": "apk" }
+    },
+    "staging": {
+      "distribution": "internal",
+      "env": { "APP_ENV": "staging" },
+      "android": { "buildType": "apk" }
+    },
+    "production": {
+      "autoIncrement": true,
+      "env": { "APP_ENV": "production" },
+      "android": { "buildType": "app-bundle" }
+    }
+  }
+}
