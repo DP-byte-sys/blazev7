@@ -160,7 +160,7 @@ jobs:
           npm run build --prefix apps/web
           test -f apps/web/dist/_headers && test -f apps/web/dist/_redirects
       - name: Deploy to this environment's Cloudflare Pages project
-        uses: cloudflare/wrangler-action@v3
+        uses: cloudflare/wrangler-action@v4
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
