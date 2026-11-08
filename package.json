@@ -17,8 +17,8 @@
     "smoke": "node scripts/smoke.mjs"
   },
   "devDependencies": {
-    "@electric-sql/pglite": "^0.5.13",
+    "@electric-sql/pglite": "^0.5.15",
     "prettier": "^3.3.3",
-    "vitest": "^5.0.5"
+    "vitest": "^5.1.0"
   }
 }
